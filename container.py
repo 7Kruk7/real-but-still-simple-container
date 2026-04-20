@@ -5,13 +5,16 @@ import subprocess
 import shutil
 import logging
 import time
-import signal
 import linux
+import json
+import urllib
+import urllib.request
+import tarfile
 
 def parse_memory(value : str) -> int:
     number = int(value[:-1])
     if number <= 0:
-        raise ValueError("Memory must be a positive intiger value")
+        raise ValueError("Memory must be a positive integer  value")
     
     unit = value[-1]
     
@@ -24,9 +27,9 @@ def parse_memory(value : str) -> int:
     elif unit.isdigit():
         return int(value)
     else:
-        raise ValueError("Unknow unit. Try K, M, G, or plain intiger")
+        raise ValueError("Unknown unit. Try K, M, G, or plain intiger")
     
-def parsering_logic() -> dict:
+def parsing_logic() -> dict:
     """Create the dictionary for further analytics"""
 
     parser = argparse.ArgumentParser(
@@ -37,6 +40,7 @@ def parsering_logic() -> dict:
 
     run_parser = subparsers.add_parser('run', help='Run a process in isolation')
 
+    run_parser.add_argument("--image", type=str, default=None)
     run_parser.add_argument("--timeout", type=int, default = 100)
     run_parser.add_argument("--memory", type=str, default = '50M') 
     run_parser.add_argument("--cpu", type=int, default = 10)
@@ -48,7 +52,8 @@ def parsering_logic() -> dict:
     config = {}
 
     if args.command == "run":
-        config = {"timeout" : int(args.timeout),
+        config = {"imagine" : args.image,
+                "timeout" : int(args.timeout),
                 "memory" : int(parse_memory(args.memory)),
                 "cpu" : int(args.cpu),
                 "log" : args.log,
@@ -56,39 +61,117 @@ def parsering_logic() -> dict:
 
     return config
 
-def setup_rootfs(container_id: str) -> str:
-    container_dir = f"/tmp/minicontainer-{container_id}"
-    image_dir = "/var/lib/minicontainer/images/base"
+def fetch_blob(image : str, auth_header : dict, digest: str):
+    blob_url = f"https://registry-1.docker.io/v2/{image}/blobs/{digest}"
+    req = urllib.request.Request(blob_url, headers=auth_header)
 
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(
+        NoRedirect,
+        urllib.request.HTTPSHandler,
+    )
+
+    try:
+        return opener.open(req)
+    except urllib.error.HTTPError as e:
+        if e.code in (301, 302, 303, 307, 308):
+            cdn_url = e.headers["Location"]
+            return urllib.request.urlopen(cdn_url)
+        raise
+    
+def fetch_manifest(image : str, auth_header : dict, reference: str, accept : str) -> dict:
+    req = urllib.request.Request(
+        f"https://registry-1.docker.io/v2/{image}/manifests/{reference}",
+        headers={**auth_header, "Accept": accept},
+    )
+    return json.loads(urllib.request.urlopen(req).read())
+
+
+def pull_image(image: str, tag: str = "latest") -> str:
+    if ":" in image:
+        image, tag = image.split(":", 1)
+    if "/" not in image:
+        image = f"library/{image}"
+
+    token_url = (
+        f"https://auth.docker.io/token"
+        f"?service=registry.docker.io&scope=repository:{image}:pull"
+    )
+    token = json.loads(urllib.request.urlopen(token_url).read())["token"]
+
+    accept = ", ".join([
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+    ])
+    auth_header = {"Authorization": f"Bearer {token}"}
+
+    manifest = fetch_manifest(image, auth_header, tag, accept)
+
+    if "manifests" in manifest and "layers" not in manifest:
+        chosen = None
+        for entry in manifest["manifests"]:
+            platform = entry.get("platform", {})
+            if (platform.get("os") == "linux"
+                    and platform.get("architecture") == "amd64"):
+                chosen = entry
+                break
+        if chosen is None:
+            available = [e.get("platform") for e in manifest["manifests"]]
+            raise RuntimeError(
+                f"No linux/amd64 manifest for {image}:{tag}. Available: {available}"
+            )
+        logging.info(f"Resolved manifest list -> {chosen['digest'][:20]}...")
+        manifest = fetch_manifest(image, auth_header, chosen["digest"], accept)
+
+    if "layers" not in manifest:
+        raise RuntimeError(
+            f"Unexpected manifest shape for {image}:{tag}: keys={list(manifest.keys())}"
+        )
+
+    image_dir = f"/var/lib/minicontainer/images/{image.replace('/', '_')}_{tag}"
+    os.makedirs(image_dir, exist_ok=True)
+
+    for layer in manifest["layers"]:
+        digest = layer["digest"]
+        logging.info(f"Pulling layer {digest[:20]}...")
+
+        with fetch_blob(image, auth_header, digest) as response:
+            with tarfile.open(fileobj=response, mode="r|gz") as tar:
+                tar.extractall(path=image_dir)
+
+    logging.info(f"Image {image}:{tag} pulled to {image_dir}")
+    return image_dir
+
+def setup_rootfs(container_id: str, image: str | None) -> str:
+    container_dir = f"/tmp/minicontainer-{container_id}"
     upper = f"{container_dir}/upper"
     work = f"{container_dir}/work"
     merged = f"{container_dir}/merged"
 
-    try:
-        os.makedirs(upper)
-        os.makedirs(work)
-        os.makedirs(merged)
+    os.makedirs(upper, exist_ok=True)
+    os.makedirs(work, exist_ok=True)
+    os.makedirs(merged, exist_ok=True)
 
+    if image is None:
+        image_dir = "/var/lib/minicontainer/images/base"
         if not os.path.exists(image_dir):
             os.makedirs(image_dir)
             subprocess.run(["bash", "setup_rootfs.sh", image_dir], check=True)
+    else:
+        image_dir = pull_image(image)
 
-        linux.mount(
-            "overlay",
-            merged,
-            "overlay",
-            0,
-            f"lowerdir={image_dir},upperdir={upper},workdir={work}"
-        )
-    except FileExistsError:
-        print(f"Directory '{container_dir}' already exists.")
-    except PermissionError:
-        print(f"Permission denied: Unable to create directories.")
-    except RuntimeError as e:
-        print(f"Failed to mount overlay: {e}")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
+    linux.mount(
+        "overlay",
+        merged,
+        "overlay",
+        0,
+        f"lowerdir={image_dir},upperdir={upper},workdir={work}",
+    )
     return merged
 
 def setup_cgroups(container_id : str, memory_bytes : int, cpu_percent : int) -> str:
@@ -162,6 +245,22 @@ def setup_network(container_id, container_pid):
     logging.info(f"Container network: {container_ip}")
     return container_ip
 
+def drop_capabilites () -> None:
+    mask = 0
+    white_list = [0,1,3,4,5,6,7,8,10,13,18,27,29,31]
+
+    for i in range(0, 41):
+        if i not in white_list:
+            linux.capdrop(i)
+
+    for element in white_list:
+        mask = mask | (1 << element)
+
+    low = mask & 0xFFFFFFFF
+    high = mask >> 32
+
+    linux.capset(low,high,low,high,0,0)
+
 def run(rootfs, cgroup_path, command, timeout, container_id):
     start_time = time.time()
     child_ready_r, child_ready_w = os.pipe()
@@ -200,6 +299,7 @@ def run(rootfs, cgroup_path, command, timeout, container_id):
 
         if inner_pid == 0:
             linux.mount("proc", "/proc", "proc", 0, "")
+            drop_capabilites()
             os.execvp(command[0], command)
         else:
             _, status = os.waitpid(inner_pid, 0)
@@ -252,13 +352,13 @@ if __name__ == "__main__":
                         logging.FileHandler("log.log")])
 
     container_id = "mc-" + uuid.uuid4().hex[:8]
-    config = parsering_logic()
+    config = parsing_logic()
     logging.info(config)
     rootfs = None
     cgroup_path = None
     try:
         setup_bridge()
-        rootfs = setup_rootfs(container_id)
+        rootfs = setup_rootfs(container_id, config["imagine"])
         logging.info(f"Rootfs created at: {rootfs}")
         cgroup_path = setup_cgroups(container_id, config["memory"], config["cpu"])
         run(rootfs, cgroup_path, config["cmd"], config["timeout"], container_id)

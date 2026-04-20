@@ -7,7 +7,7 @@ if [ -z "$ROOTFS_DIR" ]; then
     exit 1
 fi
 
-commands=("ls" "cat" "echo" "ps" "mkdir" "rm" "sh" "sleep" "hostname" "ip" "ping" "grep")
+commands=("ls" "cat" "echo" "ps" "mkdir" "rm" "sh" "sleep")
 mkdir -p "$ROOTFS_DIR/usr/bin"
 
 for cmd in "${commands[@]}"; do
@@ -27,5 +27,3 @@ mknod -m 666 "$ROOTFS_DIR/dev/urandom" c 1 9
 
 mkdir -p "$ROOTFS_DIR/proc"
 mkdir -p "$ROOTFS_DIR/tmp"
-
-ln -sf usr/bin "$1/bin"

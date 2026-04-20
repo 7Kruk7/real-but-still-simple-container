@@ -5,8 +5,12 @@
 #include <sched.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <linux/capability.h>
+#include <sys/prctl.h>
+#include <linux/prctl.h>
 
 #define STACK_SIZE 32768
+#define _LINUX_CAPABILITY_VERSION_3  0x20080522
 
 static PyObject *
 pivot_root(PyObject *self, PyObject *args) {
@@ -19,6 +23,49 @@ pivot_root(PyObject *self, PyObject *args) {
 		PyErr_SetFromErrno(PyExc_RuntimeError);
 		return NULL;
 	} else {
+		Py_RETURN_NONE;
+	}
+}
+
+static PyObject * 
+capset(PyObject *self, PyObject *args){
+
+	struct __user_cap_header_struct header;
+	header.version = _LINUX_CAPABILITY_VERSION_3;
+	header.pid = 0; 
+
+	struct __user_cap_data_struct data[2];
+
+	if (!PyArg_ParseTuple(args, "IIIIII", 
+		&data[0].effective, &data[1].effective,
+		&data[0].permitted, &data[1].permitted,
+		&data[0].inheritable, &data[1].inheritable)){
+		return NULL;
+	}
+
+	if(syscall(SYS_capset, &header, data) < 0){
+		PyErr_SetFromErrno(PyExc_OSError);
+		return NULL;
+	}
+	else{
+		Py_RETURN_NONE;
+	}
+}
+
+static PyObject * 
+capdrop(PyObject *self, PyObject *args){
+
+	unsigned int cap;
+
+	if (!PyArg_ParseTuple(args, "I", &cap)){
+		return NULL;
+	}
+
+	if(prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) < 0){
+		PyErr_SetFromErrno(PyExc_OSError);
+		return NULL;
+	}
+	else{
 		Py_RETURN_NONE;
 	}
 }
@@ -125,6 +172,8 @@ _sethostname(PyObject *self, PyObject *args) {
 
 static PyMethodDef LinuxMethods[] = {
     {"pivot_root",  pivot_root,   METH_VARARGS, "pivot_root(new_root, put_old)"},
+	{"capset",		capset,		  METH_VARARGS, "capset(header, data)"},
+	{"capdrop",		capdrop,	  METH_VARARGS, "caprop(data)"},
     {"unshare",     _unshare,     METH_VARARGS, "unshare(flags)"},
     {"setns",       _setns,       METH_VARARGS, "setns(fd, nstype)"},
     {"sethostname", _sethostname, METH_VARARGS, "sethostname(hostname)"},
