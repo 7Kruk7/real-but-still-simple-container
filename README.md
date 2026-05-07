@@ -1,140 +1,117 @@
 # Container Runtime from Scratch
 
-A Linux container runtime built from scratch in Python and C, implementing the core mechanisms that Docker uses under the hood. Pulls real images from Docker Hub and runs them in fully isolated environments.
+A Linux container runtime built from scratch in Python and C, implementing the core mechanisms that Docker uses under the hood. Pulls real images from Docker Hub and runs them in fully isolated environments with lifecycle management.
 
 ## What it does
 
-Runs a command in a fully isolated environment with its own filesystem, process tree, hostname, network, and resource limits – just like `docker run`.
+Runs a command in a fully isolated environment with its own filesystem, process tree, hostname, network, and resource limits - just like `docker run`.
 
 ```bash
-# Pull Alpine from Docker Hub and run a shell inside it
-sudo python3 container.py run --image alpine --memory 50M --cpu 50 -- /bin/sh
+# Run a container in the background (daemonized)
+sudo python3 lifecycle.py run --image alpine --memory 50M --cpu 50 -- /bin/sleep 300
 
-# Run with a custom base filesystem instead of a Docker image
-sudo python3 container.py run --memory 50M --cpu 50 -- /usr/bin/ls /
+# List running containers
+sudo python3 lifecycle.py ps
+
+# Execute a command inside a running container
+sudo python3 lifecycle.py exec mc-6ee7908c -- /bin/sh
+
+# View container logs
+sudo python3 lifecycle.py logs mc-6ee7908c
+
+# Follow logs in real time (like tail -f)
+sudo python3 lifecycle.py logs -f mc-6ee7908c
+
+# Stop a running container (SIGTERM then SIGKILL)
+sudo python3 lifecycle.py stop mc-6ee7908c
+
+# Restart with the same config
+sudo python3 lifecycle.py restart mc-6ee7908c
+
+# Remove a stopped container's state and logs
+sudo python3 lifecycle.py rm mc-6ee7908c
 ```
 
 ## How it works
 
-The container uses seven Linux kernel mechanisms, each implemented as a separate phase:
+The container runtime uses eight Linux kernel mechanisms, each implemented as a separate phase:
 
-**Phase 1 – C extension** wraps syscalls that Python does not expose natively (`unshare`, `mount`, `pivot_root`, `setns`, `sethostname`, `umount`, `umount2`, `capset`, `capdrop`). Compiled with `setup.py` into a shared library that `container.py` imports.
+**Phase 1 - C extension** wraps syscalls that Python does not expose natively (`unshare`, `mount`, `pivot_root`, `setns`, `sethostname`, `umount`, `umount2`, `capset`, `capdrop`). Compiled with `setup.py` into a shared library that the runtime imports.
 
-**Phase 2 – Mount namespace + pivot_root** replaces `chroot` with a secure root filesystem swap. The container process calls `unshare(CLONE_NEWNS)` for a private mount tree, then `pivot_root()` to make the new root permanent. The host filesystem becomes completely invisible.
+**Phase 2 - Mount namespace + pivot_root** replaces `chroot` with a secure root filesystem swap. The container process calls `unshare(CLONE_NEWNS)` for a private mount tree, then `pivot_root()` to make the new root permanent. The host filesystem becomes completely invisible.
 
-**Phase 3 – PID + UTS namespaces** give the container its own process tree (PID 1 inside) and its own hostname. The container cannot see or signal host processes.
+**Phase 3 - PID + UTS namespaces** give the container its own process tree (PID 1 inside) and its own hostname. The container cannot see or signal host processes.
 
-**Phase 4 – Overlay filesystem** stacks a writable layer on top of a read-only base image using the kernel's `overlayfs`. Changes inside the container do not modify the original image – the same image can be shared across multiple containers.
+**Phase 4 - Overlay filesystem** stacks a read-only base image with a writable upper layer using OverlayFS. Changes inside the container do not modify the base image - the same mechanism Docker uses for copy-on-write.
 
-**Phase 5 – Network namespace** creates an isolated network stack for each container. A veth pair connects the container to a Linux bridge (`br0`) on the host, and iptables NAT rules provide internet access. Each container gets its own IP address in the `10.0.0.0/24` subnet.
+**Phase 5 - Network namespace** creates an isolated network stack for each container. A veth pair connects the container to a host bridge (`br0`), with iptables NAT rules providing internet access. Each container gets its own IP address in the `10.0.0.0/24` subnet.
 
-**Phase 6 – Security hardening** drops Linux capabilities to match Docker's default whitelist (14 out of 41). Even though the container runs as root, dangerous operations like loading kernel modules, rebooting, or changing the system clock are blocked.
+**Phase 6 - Security hardening** drops Linux capabilities to Docker's default set of 14 (from 41). Even root inside the container cannot load kernel modules, reboot the host, or reconfigure networking.
 
-**Phase 7 – OCI image support** pulls real Docker images from Docker Hub using the Registry HTTP API v2. The process authenticates with a bearer token, resolves multi-arch manifest lists to the `linux/amd64` platform, downloads each layer blob (handling CDN redirects), and extracts the gzipped tar layers into the image directory.
+**Phase 7 - OCI image pulling** downloads real Docker images from Docker Hub using the Registry v2 API. Authenticates with a bearer token, fetches the manifest, resolves multi-arch images to `linux/amd64`, downloads and extracts each gzipped layer into the image directory.
 
-## Building
+**Phase 8 - Lifecycle management** adds daemonization and container lifecycle commands. Part 1 persists container state as JSON files in `/var/lib/minicontainer/containers/`. Part 2 (current) introduces a new CLI entry point (`lifecycle.py`) with `run`, `ps`, `stop`, `restart`, `exec`, `logs`, and `rm` commands. Containers run in the background using the double-fork daemon pattern, and `exec` uses `setns()` to join a running container's namespaces.
 
-```bash
-# Install dependencies
-sudo apt install build-essential python3-dev iptables
-
-# Compile the C extension
-python3 setup.py build_ext --inplace
-```
-
-## Usage
-
-```bash
-# Run Alpine Linux from Docker Hub
-sudo python3 container.py run --image alpine --memory 50M --cpu 50 -- /bin/sh
-
-# Run Ubuntu from Docker Hub
-sudo python3 container.py run --image ubuntu --memory 100M --cpu 50 -- /bin/bash
-
-# Run with a specific image tag
-sudo python3 container.py run --image alpine:3.19 --memory 50M --cpu 50 -- /bin/sh
-
-# Run with custom base filesystem (no Docker image)
-sudo python3 container.py run --memory 50M --cpu 50 -- /usr/bin/ps aux
-
-# Check process isolation
-sudo python3 container.py run --image alpine --memory 50M --cpu 50 -- /bin/ps aux
-
-# Check network isolation
-sudo python3 container.py run --image alpine --memory 50M --cpu 50 -- /bin/sh -c "ip addr show"
-
-# Ping the internet from inside the container
-sudo python3 container.py run --image alpine --memory 50M --cpu 50 -- /bin/sh -c "ping -c 2 8.8.8.8"
-```
-
-### CLI options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--image` | none | Docker image to pull (e.g. `alpine`, `ubuntu:22.04`) |
-| `--memory` | `50M` | Memory limit (`K`, `M`, `G` suffixes or plain bytes) |
-| `--cpu` | `10` | CPU limit as percentage (1–100) |
-| `--timeout` | `100` | Timeout in seconds |
-| `--log` | none | Log file path |
-
-## Project structure
+## Image pull flow
 
 ```
-container.py       – Main Python CLI and container runtime
-linux.c            – C extension wrapping Linux namespace syscalls
-setup.py           – Build script for the C extension
-setup_rootfs.sh    – Bash script that prepares a fallback base filesystem
-test_linux.py      – Tests for the C extension
-tests/             – Pytest test suite
-```
-
-## Architecture
-
-```
-sudo python3 container.py run --image alpine -- /bin/sh
+    1. GET auth.docker.io/token        - Get bearer token (anonymous for public images)
          |
          v
-    setup_bridge()        – Create bridge + iptables NAT (one-time)
-    pull_imagine()        – Auth to Docker Hub, fetch manifest, download layers
-    setup_rootfs()        – Mount overlay (image layers + writable layer)
-    setup_cgroups()       – Write CPU/memory limits to cgroup v2
+    2. GET registry-1.docker.io         - Fetch manifest by tag
+       /v2/library/alpine/manifests/latest
+         |
+         v
+    3. Manifest list?                   - If multi-arch, pick linux/amd64 digest
+       yes -> fetch again by digest     - Get single-platform manifest with layers
+         |
+         v
+    4. For each layer:
+       GET /v2/.../blobs/sha256:...     - Registry returns 302 redirect to CDN
+       Follow redirect WITHOUT auth     - CDN rejects Authorization header
+       Extract gzipped tar to image_dir
+```
+
+## Container lifecycle
+
+```
+    lifecycle.py run --image alpine -- /bin/sh
+         |
+         v
+    Double fork (daemonize)
+    Parent prints container ID, returns to terminal
+         |
+         v
+    Daemon process (grandchild):
+      setup_bridge()       - Create bridge + iptables NAT (one-time)
+      setup_rootfs()       - Mount overlay (base image + writable layer)
+      setup_cgroups()      - Write CPU/memory limits
+      save_state()         - Persist container info as JSON
          |
          v
     os.fork()
          |
-    Child:                          Parent:
-      unshare(NEWNET)                 wait for child signal
-      signal parent                   setup_network() – veth pair, bridge, IPs
+    Child:                          Parent (daemon):
+      unshare(NEWNS, NEWUTS, NEWNET)  wait for child signal
+      signal parent                   setup_network() - veth pair, bridge, IPs
       wait for parent                 signal child
-      pivot_root()                    waitpid()
-      unshare(NEWPID)
-      fork() -> PID 1
+      pivot_root()                    monitor (waitpid + VmRSS)
+      unshare(NEWPID)                 update state on exit
+      fork() -> PID 1                 cleanup on stop
         mount /proc
         drop_capabilities()
         execvp(command)
 ```
 
-### Image pull flow
+## Project structure
 
 ```
-pull_imagine("alpine")
-         |
-         v
-    1. GET auth.docker.io/token        – Get bearer token (anonymous for public images)
-         |
-         v
-    2. GET registry-1.docker.io         – Fetch manifest by tag
-       /v2/library/alpine/manifests/latest
-         |
-         v
-    3. Manifest list?                   – If multi-arch, pick linux/amd64 digest
-       yes -> fetch again by digest     – Get single-platform manifest with layers
-         |
-         v
-    4. For each layer:
-       GET /v2/.../blobs/sha256:...     – Registry returns 302 redirect to CDN
-       Follow redirect WITHOUT auth     – CDN rejects Authorization header
-       Extract gzipped tar to image_dir
+lifecycle.py       - CLI entry point with lifecycle commands (run, ps, stop, restart, exec, logs, rm)
+container.py       - Core container runtime (namespaces, cgroups, overlay, networking)
+linux.c            - C extension wrapping Linux syscalls
+setup.py           - Build script for the C extension
+setup_rootfs.sh    - Bash script that prepares the base filesystem image (fallback when no --image)
+tests/             - pytest tests for memory parsing, cgroups, cleanup
 ```
 
 ## Requirements
@@ -146,24 +123,41 @@ pull_imagine("alpine")
 - iptables (for container networking)
 - Internet access (for pulling Docker images)
 
+## Setup
+
+```bash
+# Build the C extension
+sudo python3 setup.py build_ext --inplace
+
+# Run tests
+pytest tests/ -v
+```
+
 ## Limitations
 
 - No user namespace (container runs as real root)
 - No seccomp syscall filtering
-- No container lifecycle management (start/stop/exec)
 - Networking bridge and iptables rules persist until manually removed or reboot
 - Images are re-downloaded on each run (no local image cache with deduplication)
+- `exec` currently joins mount namespace only (UTS and NET namespace fds not propagated from inner child)
+- `restart` creates a new container ID rather than reusing the old one
 
-## Running tests
+## What I learned
 
-```bash
-pytest tests/ -v
-```
+Building this project taught me how containers actually work under the hood:
+
+- There is no single kernel feature called "container" - it is a combination of namespaces, cgroups, and filesystem tricks applied to ordinary processes
+- Docker's architecture is modular: the CLI talks to the daemon, the daemon talks to containerd, and containerd uses runc to create containers. runc does the actual container creation using the same kernel primitives this project uses
+- cgroups are managed entirely through the filesystem - creating directories and writing values to files, no special syscalls needed
+- The fork/exec model is fundamental to process creation in Linux, and the gap between fork and exec is where all container isolation gets applied
+- The double-fork daemon pattern detaches a process from the terminal by ensuring the final process is not a session leader and cannot reacquire a controlling terminal
+- `setns()` is how `docker exec` works - it opens `/proc/<pid>/ns/*` files and joins each namespace, then execs the command inside
+- OCI image pulling is just HTTP requests: auth token, manifest fetch, layer download from a CDN redirect - no special protocol
 
 ## Inspired by
 
-- [rubber-docker](https://github.com/Fewbytes/rubber-docker) – Workshop on rebuilding Docker from scratch
+- [rubber-docker](https://github.com/Fewbytes/rubber-docker) - Workshop on rebuilding Docker from scratch
 - *Docker Deep Dive* by Nigel Poulton
 - [Linux Namespaces guide](https://linuxhandbook.com/namespaces/)
 - [OCI Image Specification](https://github.com/opencontainers/image-spec)
-- [dxf](https://github.com/davedoesdev/dxf) – Docker Registry v2 client in Python
+- [Linux kernel cgroups documentation](https://www.kernel.org/doc/Documentation/cgroup-v2.txt)

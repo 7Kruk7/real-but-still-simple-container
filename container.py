@@ -10,6 +10,33 @@ import json
 import urllib
 import urllib.request
 import tarfile
+from datetime import datetime
+import signal
+
+STATE_DIR = "/var/lib/minicontainer/containers"
+
+def save_state(container_id, state_dict):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    path = os.path.join(STATE_DIR, f"{container_id}.json")
+    with open(path, "w") as f:
+        json.dump(state_dict, f, indent=2)
+
+def load_state(container_id):
+    path = os.path.join(STATE_DIR, f"{container_id}.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+def list_containers():
+    if not os.path.exists(STATE_DIR):
+        return []
+    containers = []
+    for filename in os.listdir(STATE_DIR):
+        if filename.endswith(".json"):
+            with open(os.path.join(STATE_DIR, filename)) as f:
+                containers.append(json.load(f))
+    return containers
 
 def parse_memory(value : str) -> int:
     number = int(value[:-1])
@@ -52,7 +79,7 @@ def parsing_logic() -> dict:
     config = {}
 
     if args.command == "run":
-        config = {"imagine" : args.image,
+        config = {"image" : args.image,
                 "timeout" : int(args.timeout),
                 "memory" : int(parse_memory(args.memory)),
                 "cpu" : int(args.cpu),
@@ -266,14 +293,13 @@ def run(rootfs, cgroup_path, command, timeout, container_id):
     child_ready_r, child_ready_w = os.pipe()
     parent_done_r, parent_done_w = os.pipe()
 
-    linux.unshare(linux.CLONE_NEWNS | linux.CLONE_NEWUTS)
     pid = os.fork()
 
     if pid == 0:
         os.close(child_ready_r)
         os.close(parent_done_w)
 
-        linux.unshare(linux.CLONE_NEWNET)
+        linux.unshare(linux.CLONE_NEWNS | linux.CLONE_NEWUTS | linux.CLONE_NEWNET)
 
         os.write(child_ready_w, b"x")
         os.close(child_ready_w)
@@ -319,11 +345,50 @@ def run(rootfs, cgroup_path, command, timeout, container_id):
         os.write(parent_done_w, b"x")
         os.close(parent_done_w)
 
-        _, status = os.waitpid(pid, 0)
-        if os.WIFEXITED(status):
-            logging.info(f"Child's exit code: {os.WEXITSTATUS(status)}")
+        state = load_state(container_id)
+        if state:
+            state["state"] = "running"
+            state["pid"] = pid
+            state["started_at"] = datetime.now().isoformat()
+            save_state(container_id, state)
+
+        while True:
+            result = os.waitpid(pid, os.WNOHANG)
+            if result[0] != 0:
+                status = result[1]
+                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+                logging.info(f"Child's exit code: {exit_code}")
+                break
+
+            try:
+                with open(f"/proc/{pid}/status") as f:
+                    for line in f:
+                        if "VmRSS" in line:
+                            logging.info(line.strip())
+                            break
+            except FileNotFoundError:
+                logging.info("Process already exited")
+                break
+
+            elapsed = time.time() - start_time
+
+            if elapsed > timeout:
+                logging.info(f"Timeout ({timeout}s) exceeded, sending SIGTERM")
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(5)
+                try:
+                    os.kill(pid, 0)
+                    logging.info("Process still alive, sending SIGKILL")
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    logging.info("Process terminated after SIGTERM")
+                _, status = os.waitpid(pid, 0)
+                exit_code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+                logging.info(f"Child's exit code: {exit_code}")
+                break
 
             time.sleep(0.5)
+        return exit_code
         
 def cleanup(rootfs, cgroup_path, container_id):
     short_id = container_id[-8:]
@@ -358,10 +423,40 @@ if __name__ == "__main__":
     cgroup_path = None
     try:
         setup_bridge()
-        rootfs = setup_rootfs(container_id, config["imagine"])
+        rootfs = setup_rootfs(container_id, config["image"])
         logging.info(f"Rootfs created at: {rootfs}")
         cgroup_path = setup_cgroups(container_id, config["memory"], config["cpu"])
-        run(rootfs, cgroup_path, config["cmd"], config["timeout"], container_id)
+
+        state = {
+            "id": container_id,
+            "state": "created",
+            "pid": None,
+            "image": config.get("image"),
+            "command": config["cmd"],
+            "memory": config["memory"],
+            "cpu": config["cpu"],
+            "timeout": config["timeout"],
+            "rootfs": rootfs,
+            "cgroup_path": cgroup_path,
+            "created_at": datetime.now().isoformat(),
+            "started_at": None,
+            "stopped_at": None,
+            "exit_code": None,
+        }
+        save_state(container_id, state)
+
+        exit_code = run(rootfs, cgroup_path, config["cmd"], config["timeout"], container_id)
+
     finally:
+        try:
+            existing = load_state(container_id)
+            if existing:
+                existing["state"] = "stopped"
+                existing["stopped_at"] = datetime.now().isoformat()
+                existing["exit_code"] = exit_code if 'exit_code' in dir() else None
+                save_state(container_id, existing)
+        except Exception as e:
+            logging.error(f"Failed to update state: {e}")
+
         if rootfs or cgroup_path:
             cleanup(rootfs, cgroup_path, container_id)
